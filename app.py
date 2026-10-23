@@ -85,7 +85,7 @@ def train_models(df):
 
 HABITS = ['Steps_Per_Day', 'Water_Intake_L', 'Sleep_Hours']
 HABIT_NAMES = {'Steps_Per_Day':'Movement', 'Water_Intake_L':'Hydration', 'Sleep_Hours':'Rest & recovery'}
-COLORS = {'Steps_Per_Day':'#287d6c', 'Water_Intake_L':'#397bb9', 'Sleep_Hours':'#8262af'}
+COLORS = {'Steps_Per_Day':'#079681', 'Water_Intake_L':'#127bd2', 'Sleep_Hours':'#12a6aa'}
 
 
 def goal_snapshot(profile, goals):
@@ -106,6 +106,106 @@ def predict_profile(model, profile):
     return float(model.predict(pd.DataFrame([profile], columns=FEATURES))[0])
 
 
+def habit_suggestions(profile, goals):
+    """Rule-based reflection on personal goals, separate from the fitted ML model."""
+    tips = []
+    actions = {
+        'Steps_Per_Day': 'Choose an enjoyable, manageable movement break and attach it to an existing routine, such as after lunch. Increase activity gradually within your abilities. Steps do not capture all activity or its intensity.',
+        'Water_Intake_L': 'Record your usual intake accurately and keep water accessible if appropriate. Review whether your personal goal suits your circumstances; do not force extra water just to reach a number. Follow any prescribed fluid restriction.',
+        'Sleep_Hours': 'Protect a regular wind-down period and keep bedtime and wake time consistent where possible. Review whether your schedule allows enough rest. Discuss persistent sleep difficulties or daytime tiredness with a healthcare professional.',
+    }
+    for row in goal_snapshot(profile, goals):
+        c = row['Feature']
+        if not row['Known']:
+            status,detail='Measure first','This value is unknown. Record it before judging progress; the model uses a median only for prediction.'
+        elif not row['Met']:
+            gap=row['Goal']-row['Value']
+            unit={'Steps_Per_Day':'steps/day','Water_Intake_L':'L/day','Sleep_Hours':'hours/night'}[c]
+            status='Below personal goal'
+            detail=f'Gap to your selected goal: {gap:,.1f} {unit}. '+actions[c]
+        else:
+            status='Maintain & review'
+            detail='Your reported value meets your selected numeric goal. Keep a sustainable routine and review whether the goal still suits you. More is not automatically better.'
+        tips.append({'habit':row['Habit'],'feature':c,'status':status,'suggestion':detail})
+    return tips
+
+
+def build_pdf_report(profile, goals, result, df, history=None, commitment=None):
+    """Generate a two-page PDF in memory; no user data is written on the server."""
+    from io import BytesIO
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from xml.sax.saxutils import escape
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.graphics.shapes import Drawing, Rect, String
+    import reportlab
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    font_dir=Path(reportlab.__file__).parent/'fonts'
+    if 'FitSans' not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont('FitSans',str(font_dir/'Vera.ttf')))
+        pdfmetrics.registerFont(TTFont('FitSansBold',str(font_dir/'VeraBd.ttf')))
+    buffer=BytesIO()
+    blue,green,ink=colors.HexColor('#1261b3'),colors.HexColor('#079681'),colors.HexColor('#173951')
+    styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='BrandTitle',fontName='FitSansBold',fontSize=25,leading=29,textColor=blue,spaceAfter=12))
+    styles.add(ParagraphStyle(name='SectionTitle',fontName='FitSansBold',fontSize=13,leading=17,textColor=green,spaceBefore=13,spaceAfter=8))
+    styles.add(ParagraphStyle(name='BodyReport',fontName='FitSans',fontSize=9,leading=13,textColor=ink,spaceAfter=7))
+    styles.add(ParagraphStyle(name='SmallReport',fontName='FitSans',fontSize=8,leading=11,textColor=ink,spaceAfter=5))
+    styles.add(ParagraphStyle(name='ScoreReport',fontName='FitSansBold',fontSize=29,leading=35,textColor=green,alignment=TA_CENTER))
+    def p(text,style='BodyReport'):return Paragraph(escape(str(text)),styles[style])
+    def table(data,widths):
+        t=Table([[p(v,'SmallReport') for v in row] for row in data],colWidths=widths,repeatRows=1,hAlign='LEFT')
+        t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e2f1fc')),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f1faf7')]),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),8),('RIGHTPADDING',(0,0),(-1,-1),8),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),5),('LINEBELOW',(0,0),(-1,0),.6,blue)]))
+        return t
+    score=predict_profile(result['model'],profile)
+    now=datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%d %b %Y, %I:%M %p IST')
+    story=[p('FitScore | Wellbeing analytics','BrandTitle'),p('Personal reflection report • '+now),p('Educational fitness estimate. This is not a medical assessment, diagnosis or health clearance.'),Spacer(1,8),p(f'{score:.2f} / 10','ScoreReport'),p('Predicted dataset fitness score. No clinical health category is assigned.'),p('Your submitted measurements','SectionTitle')]
+    medians=result['model'].named_steps['imputer'].statistics_
+    data=[['Measurement','Submitted value','Prediction input']]
+    for i,c in enumerate(FEATURES):
+        v=profile[c]
+        data.append([LABELS[i], 'Unknown' if pd.isna(v) else f'{v:,.2f}', f'{medians[i]:,.2f} (learned median)' if pd.isna(v) else 'As submitted'])
+    story += [table(data,[190,125,196]),p('Personal-goal progress','SectionTitle')]
+    chart=Drawing(510,119)
+    for i,row in enumerate(goal_snapshot(profile,goals)):
+        y=91-i*35
+        chart.add(String(0,y+3,row['Habit'],fontName='FitSans',fontSize=9,fillColor=ink))
+        chart.add(Rect(114,y,238,12,fillColor=colors.HexColor('#e2eff4'),strokeColor=None))
+        if row['Known']:chart.add(Rect(114,y,238*row['Progress'],12,fillColor=green if row['Met'] else blue,strokeColor=None))
+        label='Unknown' if not row['Known'] else f"{row['Value']:,.1f} / {row['Goal']:g}"
+        chart.add(String(365,y+2,label,fontName='FitSans',fontSize=9,fillColor=ink))
+    story += [chart,p('Bars compare submitted habits with your own goals, not clinical thresholds. Unknown values are excluded. Example goals are editable; more water, sleep or steps is not always better.','SmallReport')]
+    outside=[c for c in FEATURES if pd.notna(profile[c]) and not df[c].min()<=profile[c]<=df[c].max()]
+    if outside:story.append(p('Outside observed training-data ranges: '+', '.join(outside)+'. Reliability may be lower.','SmallReport'))
+    story += [p('Model context','SectionTitle'),p(f"Selected algorithm: {result['winner']}. Held-out MAE: {result['metrics']['MAE']:.3f} points; RMSE: {result['metrics']['RMSE']:.3f}; R-squared: {result['metrics']['R2']:.3f}.",'SmallReport'),p('MAE is average test error, not an individual confidence interval. Model selection uses training-only five-fold cross-validation; app predictions use the final all-data refit.','SmallReport'),PageBreak(),p('Your next steps','BrandTitle'),p('Areas to review are identified against your personal goals. These suggestions use transparent rules; they are not diagnoses or personalized medical prescriptions.')]
+    for tip in habit_suggestions(profile,goals):
+        story.append(KeepTogether([p(tip['habit']+' | '+tip['status'],'SectionTitle'),p(tip['suggestion'])]))
+    if commitment:
+        story += [p('Your chosen commitment','SectionTitle'),p(commitment.get('Action','')),p('When: '+commitment.get('When','Not specified'))]
+    if history:
+        story.append(p('Recent saved check-ins','SectionTitle'))
+        rows=[['Date','Steps','Water (L)','Sleep (h)','Score']]
+        for entry in sorted(history,key=lambda e:e['Date'])[-5:]:
+            def fmt(k):return 'Unknown' if pd.isna(entry.get(k,np.nan)) else f"{entry[k]:,.1f}"
+            rows.append([entry['Date'],fmt('Steps_Per_Day'),fmt('Water_Intake_L'),fmt('Sleep_Hours'),fmt('Predicted_Fitness_Score')])
+        story += [table(rows,[112,105,98,98,98]),p('Up to five most recent explicitly saved session entries. Self-reported values do not establish measured health improvement.','SmallReport')]
+    story += [p('Evidence & limits','SectionTitle'),p('CDC recommends at least 7 hours of sleep for adults aged 18-60. WHO emphasizes that some physical activity is better than none. Water goals here are personal tracking preferences.','SmallReport'),p('CDC: https://www.cdc.gov/sleep/about/index.html\nWHO: https://www.who.int/news-room/fact-sheets/detail/physical-activity','SmallReport'),p('The score formula, data provenance and clinical validity were not supplied. Height and weight alone do not establish a health problem. Seek appropriate professional care for persistent concerns regardless of the predicted score.','SmallReport')]
+    def page(canvas,doc):
+        canvas.saveState();w,h=doc.pagesize
+        canvas.setFillColor(blue);canvas.rect(0,h-12,w,12,fill=1,stroke=0)
+        canvas.setFillColor(green);canvas.rect(w*.62,h-12,w*.38,12,fill=1,stroke=0)
+        canvas.setFont('FitSans',8);canvas.setFillColor(ink)
+        canvas.drawString(42,24,'FitScore | Personal wellbeing reflection');canvas.drawRightString(w-42,24,f'Page {doc.page}')
+        canvas.restoreState()
+    from reportlab.lib.pagesizes import A4
+    SimpleDocTemplate(buffer,pagesize=A4,rightMargin=42,leftMargin=42,topMargin=38,bottomMargin=42,title='FitScore wellbeing analytics',author='FitScore Studio').build(story,onFirstPage=page,onLaterPages=page)
+    return buffer.getvalue()
+
+
 def main():
     from datetime import date
     import streamlit as st
@@ -113,26 +213,30 @@ def main():
     import plotly.express as px
     st.set_page_config(page_title='FitScore • Make room for wellbeing',page_icon='🌱',layout='wide')
     st.markdown('''<style>
-    .stApp {background:#f7f8f3;color:#20382f}
+    .stApp {background:radial-gradient(ellipse at top right,#d6f6ea 0%,transparent 48%),linear-gradient(145deg,#f0f8ff,#eaf9f2);color:#173951}
     .block-container {max-width:1220px;padding-top:2rem;padding-bottom:3rem}
-    h1,h2,h3 {color:#203f34!important;letter-spacing:-.025em}
-    .hero {position:relative;background:linear-gradient(115deg,#183f33,#2b6b52);border-radius:26px;padding:32px 38px;margin-bottom:18px;color:#fff;overflow:hidden}
+    h1,h2,h3 {color:#123e60!important;letter-spacing:-.025em}
+    .hero {position:relative;background:linear-gradient(115deg,#094f9a 0%,#087cbb 48%,#079681 100%);border-radius:26px;padding:32px 38px;margin-bottom:18px;color:#fff;overflow:hidden}
     .hero h1 {color:#fff!important;font-size:clamp(2rem,4vw,3.25rem);line-height:1.1;max-width:720px;margin:12px 0}
-    .hero p {color:#dcecdf;max-width:660px;font-size:1.05rem;margin-bottom:8px}
-    .eyebrow {font-size:.75rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:#dae9b6}
+    .hero p {color:#e3f8ff;max-width:660px;font-size:1.05rem;margin-bottom:8px}
+    .eyebrow {font-size:.75rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:#bdffe4}
     .hero-mark {position:absolute;right:40px;top:24px;font-size:110px;opacity:.15;transform:rotate(-12deg)}
     .pill {display:inline-block;border:1px solid #819e88;border-radius:30px;padding:5px 12px;font-size:.75rem;color:#f5f8ee}
-    .note {background:#ecf0e2;border-left:4px solid #799051;border-radius:0 12px 12px 0;padding:14px 18px;color:#35452b;margin:12px 0 22px}
-    .habit {background:white;border:1px solid #e0e7dc;border-top:4px solid var(--accent);border-radius:18px;padding:20px;min-height:150px}
-    .habit .value {font-size:1.8rem;font-weight:700;color:#203f34;margin:7px 0}
-    .habit small {color:#607264}
+    .note {background:#e0f6f4;border-left:4px solid #079681;border-radius:0 12px 12px 0;padding:14px 18px;color:#145760;margin:12px 0 22px}
+    .habit {background:white;border:1px solid #cce8ed;border-top:4px solid var(--accent);border-radius:18px;padding:20px;min-height:150px}
+    .habit .value {font-size:1.8rem;font-weight:700;color:#123e60;margin:7px 0}
+    .habit small {color:#456780}
     .habit .tag {font-size:.75rem;letter-spacing:.04em;text-transform:uppercase;font-weight:700;color:var(--accent)}
-    .action {background:#fff;border:1px solid #dee6d7;border-radius:18px;padding:22px;min-height:180px;margin-bottom:12px}
-    .action b {color:#244e3d;font-size:1.08rem}
-    .action p {color:#566759;line-height:1.6;margin:10px 0 0}
-    .stButton>button,.stDownloadButton>button {border-radius:12px;min-height:44px}
-    [data-testid="stMetric"] {background:#fff;border:1px solid #e0e7dc;padding:18px;border-radius:16px}
-    [data-testid="stSidebar"] {background:#edf1e7}
+    .action {background:#fff;border:1px solid #c5e6eb;border-radius:18px;padding:22px;min-height:180px;margin-bottom:12px}
+    .action b {color:#116593;font-size:1.08rem}
+    .action p {color:#436276;line-height:1.6;margin:10px 0 0}
+    .stButton>button,.stDownloadButton>button {border-radius:12px;min-height:44px;transition:transform .15s,box-shadow .15s}
+    .stButton>button:hover,.stDownloadButton>button:hover {transform:translateY(-2px);box-shadow:0 6px 18px #087cbb25}
+    .habit {box-shadow:0 6px 20px #0b6c9310;transition:transform .2s,box-shadow .2s}
+    .habit:hover {transform:translateY(-4px);box-shadow:0 10px 24px #07968120}
+    @media(prefers-reduced-motion:reduce) {.habit,.stButton>button,.stDownloadButton>button {transition:none;transform:none!important}}
+    [data-testid="stMetric"] {background:#fff;border:1px solid #cce8ed;padding:18px;border-radius:16px}
+    [data-testid="stSidebar"] {background:#e5f3fb}
     [data-baseweb="tab-list"] {gap:12px}
     @media(max-width:650px) {.hero {padding:24px}.hero-mark {display:none}}
     @media(prefers-reduced-motion:no-preference) {.hero {animation:appear .5s ease-out}@keyframes appear {from {opacity:0;transform:translateY(8px)}to {opacity:1;transform:translateY(0)}}}
@@ -200,8 +304,8 @@ def main():
                 st.info('You do not need a perfect routine to start paying attention to it.')
             else:
                 score=predict_profile(result['model'],current)
-                fig=go.Figure(go.Indicator(mode='gauge+number',value=score,number={'suffix':' / 10','font':{'size':45,'color':'#245740'}},gauge={'axis':{'range':[1,10],'tickvals':[1,3,5,7,10]},'bar':{'color':'#42785a'},'bgcolor':'#e6eddf','borderwidth':0,'steps':[{'range':[1,10],'color':'#e6eddf'}]}))
-                fig.update_layout(height=250,margin=dict(l=25,r=25,t=30,b=10),paper_bgcolor='rgba(0,0,0,0)',font={'color':'#365143'})
+                fig=go.Figure(go.Indicator(mode='gauge+number',value=score,number={'suffix':' / 10','font':{'size':45,'color':'#087b91'}},gauge={'axis':{'range':[1,10],'tickvals':[1,3,5,7,10]},'bar':{'color':'#079681'},'bgcolor':'#dceff6','borderwidth':0,'steps':[{'range':[1,10],'color':'#dceff6'}]}))
+                fig.update_layout(height=250,margin=dict(l=25,r=25,t=30,b=10),paper_bgcolor='rgba(0,0,0,0)',font={'color':'#234c69'})
                 st.plotly_chart(fig,width='stretch',config={'displayModeBar':False})
                 st.caption('Predicted dataset fitness score. No healthy/unhealthy category is assigned.')
                 st.markdown('<div class="note"><b>Let this start a conversation, not end one.</b><br>A score is not a health clearance. The habits you can sustain deserve more attention than a decimal.</div>',unsafe_allow_html=True)
@@ -229,6 +333,17 @@ def main():
             st.caption('Progress bars show your own numeric goals, not a health rating. Values above a goal earn no extra credit; more is not automatically healthier.')
             known=sum(r['Known'] for r in rows);met=sum(r['Met'] for r in rows)
             st.write(f'**{met} of {known} measured habits meet your personal goals.** Choose one manageable action in “My next step.”')
+            st.subheader('Your focus areas & practical next steps')
+            st.caption('These are gaps to your chosen goals, not diagnosed health weaknesses. Unknown values need measurement first.')
+            for tip in habit_suggestions(current,goals):
+                with st.expander(tip['habit']+' · '+tip['status'],expanded=tip['status']!='Maintain & review'):
+                    st.write(tip['suggestion'])
+            st.divider()
+            st.subheader('Take your insights with you')
+            st.write('Export your snapshot, personal-goal chart, focus areas, suggestions, saved commitment and recent check-ins.')
+            pdf_bytes=build_pdf_report(current,goals,result,df,st.session_state['checkins'],st.session_state.get('commitment'))
+            st.download_button('📄 Export health analytics as PDF',data=pdf_bytes,file_name='FitScore_Health_Analytics.pdf',mime='application/pdf',key='pdf_export',type='primary',width='stretch')
+            st.caption('The report uses the last submitted snapshot and current personal goals. It is generated in memory and downloaded only when you click.')
     with tabs[1]:
         st.subheader('Explore a different routine')
         st.write('Keep your height and weight fixed. Change one or more habits and compare the model’s outputs.')
@@ -328,7 +443,7 @@ def main():
         st.caption('MAE and RMSE are errors in score points; lower is better. R² measures fit relative to a mean baseline and is not percentage accuracy.')
         st.dataframe(result['comparison'],hide_index=True,width='stretch')
         st.write(f"Selected: **{result['winner']}** by lowest training-only five-fold CV MAE. Training split: {result['metrics']['train_rows']} rows. Held-out test: {result['metrics']['test_rows']} rows. Mean-only baseline test MAE: {result['metrics']['Baseline MAE']:.3f}.")
-        fig=px.scatter(result['test'],x='Actual',y='Predicted',color_discrete_sequence=['#42785a'],opacity=.6)
+        fig=px.scatter(result['test'],x='Actual',y='Predicted',color_discrete_sequence=['#079681'],opacity=.6)
         fig.add_shape(type='line',x0=1,y0=1,x1=10,y1=10,line=dict(color='#b28b43',dash='dash'))
         fig.update_layout(height=310,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='white',title='Actual vs predicted • untouched holdout')
         st.plotly_chart(fig,width='stretch')
